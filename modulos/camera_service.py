@@ -1,0 +1,574 @@
+"""
+Módulo de gestión de cámara IP (Video en vivo y Control PTZ).
+
+ Captura de video IRL
+   - Se conecta al stream RTSP de la cámara usando OpenCV
+   - Reduce el retraso (lag) al mínimo configurando el buffer en 1 fotograma
+   - Reconecta automáticamente si se pierde la conexión o la señal de video
+
+ Acceso seguro a imágenes (Thread-safe)
+   - Guarda el último fotograma en segundo plano y permite consultarlo desde otros módulos sin congelar la app (usando Locks).
+
+ Control de movimiento y lente (Protocolo ISAPI de HIKVISION):
+   - Mueve la cámara (rotación horizontal/vertical y zoom).
+    - Controla el enfoque manual.
+   - Maneja la autenticación y las peticiones HTTP seguras con la cámara.
+"""
+
+import threading
+import time
+import xml.etree.ElementTree as ET
+import copy
+import logging
+from urllib.parse import quote
+
+import cv2
+import requests
+from requests.auth import HTTPDigestAuth
+
+
+_logger = logging.getLogger(__name__)
+
+FOCUS_CAPABILITIES_PENDING = 'pending'
+FOCUS_CAPABILITIES_VALIDATED = 'validated'
+FOCUS_CAPABILITIES_UNKNOWN = 'unknown'
+FOCUS_CAPABILITIES_INCOMPATIBLE = 'incompatible'
+
+
+class CameraService:
+    def __init__(self, user: str, password: str, *, allow_focus_auto_fallback=False):
+        self.ultimo_frame = None
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+        self.conectado = False
+        self.ultimo_error = None
+        self.session = requests.Session()
+        self.session.auth = HTTPDigestAuth(user, password)
+        self._frame_at = 0.0
+        self.frame_sequence = 0
+        self.stream_epoch = 0
+        self._reader = None
+        self._focus_checked = False
+        self._focus_config = None
+        self._focus_modes = set()
+        self.allow_focus_auto_fallback = bool(allow_focus_auto_fallback)
+        self.focus_capability_state = FOCUS_CAPABILITIES_PENDING
+        self.focus_capability_error = None
+        self.focus_validation = 'Capacidades de enfoque pendientes de validar'
+
+    @staticmethod
+    def _xml_local_name(tag):
+        return tag.split('}', 1)[-1]
+
+    @classmethod
+    def _focus_style(cls, root):
+        try:
+            return next(e for e in root.iter()
+                        if cls._xml_local_name(e.tag) == 'focusStyle')
+        except StopIteration as exc:
+            raise ValueError('La respuesta ISAPI no contiene focusStyle') from exc
+
+    @classmethod
+    def _get_error_detail(cls, response):
+        details = [f'HTTP {response.status_code}']
+        try:
+            root = ET.fromstring(response.text)
+            wanted = ('statusCode', 'statusString', 'subStatusCode', 'description')
+            for name in wanted:
+                value = next((e.text.strip() for e in root.iter()
+                              if cls._xml_local_name(e.tag) == name and e.text and e.text.strip()), None)
+                if value:
+                    details.append(f'{name}={value}')
+        except (ET.ParseError, AttributeError):
+            pass
+        return '; '.join(details)
+
+    def _get_xml(self, url, endpoint):
+        response = self.session.get(url, timeout=2.0)
+        if not 200 <= response.status_code < 300:
+            raise ValueError(f'GET {endpoint}: {self._get_error_detail(response)}')
+        try:
+            return ET.fromstring(response.text)
+        except ET.ParseError as exc:
+            raise ValueError(f'GET {endpoint}: XML no válido') from exc
+
+    def _focus_capabilities(self, ip, valid):
+        if self._focus_checked:
+            return (self._focus_config is not None
+                    and self.focus_capability_state != FOCUS_CAPABILITIES_UNKNOWN)
+        base = f'http://{ip}/ISAPI/Image/channels/1/focusConfiguration'
+        if not valid():
+            return False
+
+        modes = set()
+        capability_error = None
+        try:
+            capabilities = self._get_xml(
+                base + '/capabilities',
+                '/ISAPI/Image/channels/1/focusConfiguration/capabilities',
+            )
+            if self._xml_local_name(capabilities.tag) != 'FocusConfiguration':
+                raise ValueError('La cámara no devuelve capacidades FocusConfiguration')
+            style = self._focus_style(capabilities)
+            modes = {value.strip() for value in style.get('opt', '').split(',') if value.strip()}
+            if not modes:
+                raise ValueError('La respuesta de capacidades no contiene focusStyle@opt')
+        except Exception as exc:
+            capability_error = str(exc)
+
+        if not valid():
+            return False
+
+        config = None
+        config_error = None
+        current_mode = None
+        try:
+            config = self._get_xml(
+                base,
+                '/ISAPI/Image/channels/1/focusConfiguration',
+            )
+            if self._xml_local_name(config.tag) != 'FocusConfiguration':
+                raise ValueError('Configuración de enfoque no válida')
+            current_mode = (self._focus_style(config).text or '').strip() or None
+        except Exception as exc:
+            config_error = str(exc)
+            config = None
+
+        if not valid():
+            return False
+
+        self._focus_checked = True
+        self._focus_modes = modes
+        self._focus_config = config
+
+        if capability_error:
+            self.focus_capability_state = FOCUS_CAPABILITIES_UNKNOWN
+            self.focus_capability_error = capability_error
+            actual = current_mode or 'desconocido'
+            self.focus_validation = (
+                'Autofoco no validado: capacidades ISAPI desconocidas; '
+                f'{capability_error}; focusStyle actual={actual}; '
+                'no se envía PUT automático'
+            )
+            return False
+
+        if config_error:
+            self.focus_capability_state = FOCUS_CAPABILITIES_UNKNOWN
+            self.focus_capability_error = config_error
+            self.focus_validation = (
+                'Autofoco no validado: configuración ISAPI no verificable; '
+                f'{config_error}; no se envía PUT automático'
+            )
+            return False
+
+        if 'AUTO' not in modes:
+            self.focus_capability_state = FOCUS_CAPABILITIES_INCOMPATIBLE
+            self.focus_capability_error = (
+                'AUTO no figura en focusStyle@opt=' + ','.join(sorted(modes))
+            )
+            self.focus_validation = (
+                'Autofoco AUTO incompatible confirmado por ISAPI: '
+                f'focusStyle@opt={",".join(sorted(modes))}; '
+                f'focusStyle actual={current_mode or "desconocido"}'
+            )
+            return True
+
+        self.focus_capability_state = FOCUS_CAPABILITIES_VALIDATED
+        self.focus_capability_error = None
+        self.focus_validation = (
+            'AUTO anunciado por ISAPI; modos=' + ','.join(sorted(modes)) +
+            '; efecto óptico pendiente de prueba física'
+        )
+        return True
+
+    def _focus_mode(self, ip, mode, valid, *, allow_unknown=False):
+        capabilities_ok = self._focus_capabilities(ip, valid)
+        fallback = (
+            allow_unknown and mode == 'AUTO'
+            and self.focus_capability_state == FOCUS_CAPABILITIES_UNKNOWN
+            and self._focus_config is not None
+        )
+        if (not capabilities_ok and not fallback) or not valid():
+            return False
+        if mode not in self._focus_modes and not fallback:
+            self.focus_capability_state = FOCUS_CAPABILITIES_INCOMPATIBLE
+            self.focus_capability_error = f'{mode} no figura en focusStyle@opt'
+            self.focus_validation = (
+                f'Modo de enfoque {mode} no anunciado por ISAPI; '
+                f'focusStyle@opt={",".join(sorted(self._focus_modes))}; '
+                'no se envía PUT'
+            )
+            return False
+        config = copy.deepcopy(self._focus_config)
+        style = self._focus_style(config)
+        style.text = mode
+        if not valid():
+            return False
+               # Conservar el namespace original sin agregar el prefijo ns0.
+        if config.tag.startswith("{"):
+            namespace = config.tag[1:].split("}", 1)[0]
+            ET.register_namespace("", namespace)
+
+        xml_data = ET.tostring(
+            config,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+
+        if not valid():
+            return False
+
+        ok = self._put_xml(
+            f"http://{ip}/ISAPI/Image/channels/1/focusConfiguration",
+            xml_data,
+            timeout=2.0,
+        )
+
+        if ok:
+            self._focus_config = config
+
+        return ok
+
+    def enfocar_nativo(self, ip, valid=lambda: True):
+        # Una consulta fallida puede volver a intentarse sin reiniciar.
+        if self.focus_capability_state == FOCUS_CAPABILITIES_UNKNOWN:
+            self._focus_checked = False
+
+        self._focus_capabilities(ip, valid)
+
+        fallback = (
+            self.allow_focus_auto_fallback
+            and self.focus_capability_state == FOCUS_CAPABILITIES_UNKNOWN
+            and self._focus_config is not None
+        )
+
+        ok = self._focus_mode(
+            ip,
+            "AUTO",
+            valid,
+            allow_unknown=fallback,
+        )
+
+        if not valid():
+            return "Autofocus cancelado por una orden posterior"
+
+        if ok:
+            # Verificar el modo mediante lectura, después de solicitar AUTO.
+            try:
+                config = self._get_xml(
+                    f"http://{ip}/ISAPI/Image/channels/1/focusConfiguration",
+                    "/ISAPI/Image/channels/1/focusConfiguration",
+                )
+
+                if not valid():
+                    return "Autofocus cancelado por una orden posterior"
+
+                if self._xml_local_name(config.tag) != "FocusConfiguration":
+                    raise ValueError(
+                        "La lectura de verificación no es FocusConfiguration"
+                    )
+
+                actual = (self._focus_style(config).text or "").strip()
+                self._focus_config = config
+
+                if actual != "AUTO":
+                    return (
+                        "Autofoco no verificado: la cámara informa "
+                        f"{actual or 'modo vacío'}"
+                    )
+
+            except Exception as exc:
+                return (
+                    "Autofoco no verificado: "
+                    f"no se pudo releer el modo ({exc})"
+                )
+
+            suffix = " (capacidades no disponibles)" if fallback else ""
+
+            return (
+                "Modo AUTO verificado por lectura ISAPI"
+                + suffix
+                + "; comprobar nitidez en imagen"
+            )
+
+        if fallback:
+            return self.ultimo_error or self.focus_validation
+
+        if self.focus_capability_state in (
+            FOCUS_CAPABILITIES_UNKNOWN,
+            FOCUS_CAPABILITIES_INCOMPATIBLE,
+        ):
+            return self.focus_validation
+
+        return self.ultimo_error or self.focus_validation
+
+    def establecer_manual(self, ip, valid=lambda: True):
+        # Sólo se cambia el modo si la cámara lo anuncia. El movimiento manual
+        # original permanece disponible si no ofrece FocusConfiguration.
+        if not self._focus_capabilities(ip, valid):
+            if self.focus_capability_state == FOCUS_CAPABILITIES_UNKNOWN:
+                self.focus_validation = (
+                    'Modo MANUAL no confirmado por ISAPI; '
+                    'se conserva el control manual continuo'
+                )
+            return False
+        return self._focus_mode(ip, 'MANUAL', valid)
+
+    def iniciar_lectura(self, url):
+        self._reader = threading.Thread(target=self.lector_rtsp, args=(url,), daemon=True)
+        self._reader.start()
+        return self._reader
+
+    def _invalidar_video(self, error=None):
+        with self.lock:
+            self.conectado = False
+            self.ultimo_frame = None
+            self._frame_at = 0.0
+            self.stream_epoch += 1
+        if error:
+            self.ultimo_error = error
+
+    @staticmethod
+    def url_rtsp(user: str, password: str, ip: str, canal: str = "101", puerto: int = 554) -> str:
+        u = quote(user, safe="")
+        p = quote(password, safe="")
+        return f"rtsp://{u}:{p}@{ip}:{puerto}/Streaming/Channels/{canal}"
+
+    def detener_lectura(self):
+        self._stop.set()
+        self._invalidar_video()
+
+    def cerrar(self):
+        self.detener_lectura()
+        if self._reader is not None and self._reader is not threading.current_thread():
+            self._reader.join()
+        self.session.close()
+
+    @staticmethod
+    def _abrir_rtsp(url, *, open_timeout_ms=2000, read_timeout_ms=2000):
+        return cv2.VideoCapture(url, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_ms,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, read_timeout_ms,
+        ])
+
+    def lector_rtsp(self, rtsp_url: str):
+        self._invalidar_video()
+        while not self._stop.is_set():
+            cap = None
+            try:
+                cap = self._abrir_rtsp(rtsp_url)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not cap.isOpened():
+                    self._invalidar_video("No se pudo abrir el stream RTSP")
+                else:
+                    while not self._stop.is_set():
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
+                            self._invalidar_video("Se perdió la señal de video")
+                            break
+                        with self.lock:
+                            if self._stop.is_set():
+                                break
+                            self.ultimo_frame = frame.copy()
+                            self._frame_at = time.monotonic()
+                            self.frame_sequence += 1
+                            self.conectado = True
+            except Exception:
+                self._invalidar_video("Error de transporte RTSP")
+            finally:
+                if cap is not None:
+                    cap.release()
+            self._stop.wait(1)
+        self._invalidar_video()
+
+    def copiar_muestra(self, max_age_s=1.5, *, after_sequence=None):
+        """Muestra reciente; frame=None indica secuencia ya vista, no señal perdida.
+
+        La caducidad se comprueba antes de evitar la copia del duplicado.
+        """
+        with self.lock:
+            if (self._stop.is_set() or not self.conectado or self.ultimo_frame is None
+                    or time.monotonic() - self._frame_at > max_age_s):
+                return None
+            frame = None if self.frame_sequence == after_sequence else self.ultimo_frame.copy()
+            return frame, self.frame_sequence, self._frame_at, self.stream_epoch
+
+    def copiar_frame(self):
+        sample = self.copiar_muestra()
+        return sample[0] if sample is not None else None
+
+    @staticmethod
+    def capturar_frame_rtsp(
+        rtsp_url: str,
+        intentos: int = 3,
+        *,
+        open_timeout_ms: int = 2000,
+        read_timeout_ms: int = 2000,
+    ):
+        cap = None
+        started = time.monotonic()
+        try:
+            open_started = time.monotonic()
+            try:
+                cap = CameraService._abrir_rtsp(
+                    rtsp_url,
+                    open_timeout_ms=open_timeout_ms,
+                    read_timeout_ms=read_timeout_ms,
+                )
+            except Exception:
+                _logger.exception(
+                    "RTSP VideoCapture constructor raised after %.3f s "
+                    "(open_timeout_ms=%d, read_timeout_ms=%d)",
+                    time.monotonic() - open_started,
+                    open_timeout_ms,
+                    read_timeout_ms,
+                )
+                raise
+
+            opened_at = time.monotonic()
+            _logger.warning(
+                "RTSP VideoCapture constructor returned after %.3f s "
+                "(open_timeout_ms=%d, read_timeout_ms=%d)",
+                opened_at - open_started,
+                open_timeout_ms,
+                read_timeout_ms,
+            )
+
+            is_opened_started = time.monotonic()
+            try:
+                is_opened = cap.isOpened()
+            except Exception:
+                _logger.exception(
+                    "RTSP isOpened() raised after %.3f s",
+                    time.monotonic() - is_opened_started,
+                )
+                raise
+            opened_at = time.monotonic()
+            _logger.warning(
+                "RTSP isOpened() returned %s in %.3f s; elapsed since capture start %.3f s",
+                is_opened,
+                opened_at - is_opened_started,
+                opened_at - started,
+            )
+            if not is_opened:
+                _logger.error(
+                    "RTSP open failed: isOpened() returned false"
+                )
+                return None
+
+            for attempt in range(1, intentos + 1):
+                read_started = time.monotonic()
+                try:
+                    ret, actual = cap.read()
+                except Exception:
+                    _logger.exception(
+                        "RTSP read raised an exception on attempt %d/%d after %.3f s",
+                        attempt,
+                        intentos,
+                        time.monotonic() - read_started,
+                    )
+                    raise
+
+                if ret and actual is not None:
+                    try:
+                        frame = actual.copy()
+                    except Exception:
+                        _logger.exception(
+                            "RTSP frame copy failed on attempt %d/%d",
+                            attempt,
+                            intentos,
+                        )
+                        raise
+                    _logger.warning(
+                        "RTSP first valid frame on read %d/%d: read duration %.3f s, "
+                        "total elapsed %.3f s; frame shape=%s",
+                        attempt,
+                        intentos,
+                        time.monotonic() - read_started,
+                        time.monotonic() - started,
+                        getattr(frame, "shape", None),
+                    )
+                    return frame
+
+                _logger.warning(
+                    "RTSP read returned no frame on attempt %d/%d after %.3f s "
+                    "(ret=%s, frame_is_none=%s)",
+                    attempt,
+                    intentos,
+                    time.monotonic() - read_started,
+                    ret,
+                    actual is None,
+                )
+
+            _logger.error(
+                "RTSP read failed: no valid frame after %d attempts; total elapsed %.3f s",
+                intentos,
+                time.monotonic() - started,
+            )
+            return None
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    _logger.exception("RTSP VideoCapture.release() raised an exception")
+
+    def _put_xml(self, url, xml, timeout=.5):
+        try:
+            response = self.session.put(url, data=xml, timeout=timeout,
+                                        headers={"Content-Type": "application/xml"})
+            if not 200 <= response.status_code < 300:
+                detalle = self._get_error_detail(response)
+                raise ValueError(f"Rechazo de la cámara: {detalle}")
+            if response.text.strip():
+                root = ET.fromstring(response.text)
+                codes = [e.text for e in root.iter() if e.tag.split('}')[-1] == "statusCode"]
+                if root.tag.split('}')[-1] != 'ResponseStatus' or not codes:
+                    raise ValueError('Respuesta ISAPI inesperada; operación no confirmada')
+                if any((code or '').strip() != "1" for code in codes):
+                    raise ValueError("Rechazo ISAPI: statusCode=" + str(codes))
+            self.ultimo_error = None
+            return True
+        except Exception as exc:
+            self.ultimo_error = str(exc) if isinstance(exc, ValueError) else f"{type(exc).__name__}: petición ISAPI fallida"
+            return False
+
+    def mover_camara(self, ip, pan=0, tilt=0, zoom=0, focus=0) -> bool:
+        detener = pan == 0 and tilt == 0 and zoom == 0 and focus == 0
+        outcomes, errors = [], []
+        if pan != 0 or tilt != 0 or zoom != 0 or detener:
+            url = f"http://{ip}/ISAPI/PTZCtrl/channels/1/continuous"
+            xml = f"<PTZData><pan>{pan}</pan><tilt>{tilt}</tilt><zoom>{zoom}</zoom></PTZData>"
+            outcomes.append(self._put_xml(url, xml))
+            if not outcomes[-1]:
+                errors.append(self.ultimo_error)
+
+        if focus != 0 or detener:
+            url = f"http://{ip}/ISAPI/System/Video/inputs/channels/1/focus"
+            xml = f"<FocusData><focus>{focus}</focus></FocusData>"
+            outcomes.append(self._put_xml(url, xml))
+            if not outcomes[-1]:
+                errors.append(self.ultimo_error)
+        self.ultimo_error = "; ".join(errors) if errors else None
+        return bool(outcomes) and all(outcomes)
+
+    def configurar_modo_dia_noche(self, ip, modo: str) -> bool:
+        valores = {
+            "dia": "day",
+            "día": "day",
+            "noche": "night",
+            "auto": "auto",
+        }
+        valor = valores.get((modo or "").strip().lower())
+        if valor is None:
+            self.ultimo_error = f"Modo dia/noche no valido: {modo}"
+            return False
+
+        url = f"http://{ip}/ISAPI/Image/channels/1/ircutFilter"
+        xml = (
+            "<IrcutFilter>"
+            f"<IrcutFilterType>{valor}</IrcutFilterType>"
+            "</IrcutFilter>"
+        )
+        return self._put_xml(url, xml, timeout=2)
+
