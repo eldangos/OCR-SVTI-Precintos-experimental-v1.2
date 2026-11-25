@@ -72,6 +72,8 @@ from modulos.settings_store import (
     save_camera_settings,
     settings_completos,
 )
+from modulos.yolo_runtime import YOLO_RESULT_MAX_AGE_S
+from modulos.yolo_worker import YoloWorker
 from ui.hold_button import HoldButton
 from ui.settings_dialog import SettingsDialog
 from ui.styles import APP_STYLESHEET
@@ -168,6 +170,9 @@ class MainWindow(QMainWindow):
         self._video_epoch = None
         self._evidence = None
         self._held_ptz = set()
+        self._yolo_enabled = False
+        self._yolo_error_latched = False
+        self._yolo_last_result_at = None
 
         self._ptz = PtzWorker(self)
         self._ptz.error.connect(self._on_ptz_error)
@@ -188,6 +193,12 @@ class MainWindow(QMainWindow):
         self._captura_alta_error.connect(self._on_captura_alta_error)
 
         self._armar_ui()
+        self._yolo_worker = YoloWorker(self)
+        self._yolo_worker.status_changed.connect(self._on_yolo_status)
+        self._yolo_worker.result_ready.connect(self._on_yolo_result)
+        self._yolo_worker.failed.connect(self._on_yolo_error)
+        self._yolo_worker.log_message.connect(self._on_yolo_log)
+        self._video.roi_selected.connect(self._on_yolo_roi_selected)
         self._atajos()
         app = QApplication.instance()
         if app is not None:
@@ -209,6 +220,22 @@ class MainWindow(QMainWindow):
         self._lbl_canal = QLabel(self._texto_canal())
         self._lbl_canal.setWordWrap(True)
         self._lbl_ocr_motor = QLabel("Motor OCR: cargando…")
+
+        self._btn_yolo = QPushButton("Activar detector YOLO")
+        self._btn_yolo.setCheckable(True)
+        self._btn_yolo.toggled.connect(self._alternar_yolo)
+        self._btn_yolo_seleccionar = QPushButton("Seleccionar / recuperar objetivo")
+        self._btn_yolo_seleccionar.setCheckable(True)
+        self._btn_yolo_seleccionar.setEnabled(False)
+        self._btn_yolo_seleccionar.toggled.connect(self._alternar_seleccion_yolo)
+        self._lbl_yolo_estado = QLabel("YOLO local: desactivado")
+        self._lbl_yolo_estado.setWordWrap(True)
+
+        caja_yolo = QGroupBox("Detección y seguimiento local")
+        lay_yolo = QVBoxLayout(caja_yolo)
+        lay_yolo.addWidget(self._btn_yolo)
+        lay_yolo.addWidget(self._btn_yolo_seleccionar)
+        lay_yolo.addWidget(self._lbl_yolo_estado)
 
         self._btn_config = QPushButton("Configurar cámara")
         self._btn_config.clicked.connect(self._abrir_config)
@@ -430,6 +457,7 @@ class MainWindow(QMainWindow):
         lay_lat.addWidget(caja_ptz)
         lay_lat.addWidget(caja_lente)
         lay_lat.addWidget(caja_vel)
+        lay_lat.addWidget(caja_yolo)
         lay_lat.addWidget(caja_ocr, 1)
         lay_lat.addWidget(ayuda)
 
@@ -1071,12 +1099,26 @@ class MainWindow(QMainWindow):
         if frame is not None:
             self._video.mostrar_frame(frame)
             self._last_display_sequence = sequence
+            if self._yolo_enabled:
+                self._yolo_worker.submit_frame(
+                    frame,
+                    sequence=sequence,
+                    submitted_at=captured_at,
+                    generation=self._generation,
+                    stream_epoch=stream_epoch,
+                )
         packet = self._region_packet
         if (DETECCION_EN_VIVO and packet and frame is not None and packet['shape'] == list(frame.shape)
                 and time.monotonic() - packet['captured_at'] <= REGION_MAX_AGE_S):
             self._video.mostrar_regiones(packet['regions'])
         else:
             self._video.mostrar_regiones([])
+        if (
+            self._yolo_last_result_at is not None
+            and time.monotonic() - self._yolo_last_result_at > YOLO_RESULT_MAX_AGE_S
+        ):
+            self._video.mostrar_detecciones_yolo([])
+            self._yolo_last_result_at = None
         if (DETECCION_EN_VIVO and frame is not None and self._ocr_listo and sequence != self._last_sequence
                 and time.monotonic() - self._last_video_request >= SEGUIMIENTO_INTERVALO_S):
             self._last_sequence = sequence
@@ -1117,6 +1159,71 @@ class MainWindow(QMainWindow):
                 and context['stream_epoch'] == self._video_epoch
                 and time.monotonic()-context['captured_at'] <= REGION_MAX_AGE_S and not self._ocr_ocupado):
             self._lbl_ocr_estado.setText('Candidato en video (requiere captura): ' + (analysis.suggested_text or 'sin lectura'))
+
+    def _alternar_yolo(self, enabled: bool):
+        self._yolo_enabled = bool(enabled)
+        self._yolo_error_latched = False
+        self._video.mostrar_detecciones_yolo([])
+        self._yolo_last_result_at = None
+        if enabled:
+            self._btn_yolo.setText("Desactivar detector YOLO")
+            self._btn_yolo_seleccionar.setEnabled(True)
+            self._yolo_worker.start()
+        else:
+            self._btn_yolo.setText("Activar detector YOLO")
+            self._btn_yolo_seleccionar.setChecked(False)
+            self._btn_yolo_seleccionar.setEnabled(False)
+            self._video.habilitar_seleccion_roi(False)
+            self._yolo_worker.stop()
+            self._lbl_yolo_estado.setText("YOLO local: desactivado")
+
+    def _alternar_seleccion_yolo(self, enabled: bool):
+        enabled = bool(enabled and self._yolo_enabled)
+        self._video.habilitar_seleccion_roi(enabled)
+        if enabled:
+            self._lbl_yolo_estado.setText(
+                "Arrastra un rectángulo sobre el precinto para seleccionarlo o recuperarlo."
+            )
+
+    def _on_yolo_roi_selected(self, box):
+        if not self._yolo_enabled:
+            return
+        self._yolo_worker.select_roi(box)
+        self._btn_yolo_seleccionar.setChecked(False)
+        self._lbl_yolo_estado.setText("ROI manual enviada; siguiendo el objetivo…")
+
+    def _on_yolo_status(self, message: str):
+        if self._yolo_enabled and not (
+            self._yolo_error_latched and message == "YOLO detenido"
+        ):
+            self._lbl_yolo_estado.setText(message)
+
+    def _on_yolo_error(self, message: str):
+        self._yolo_error_latched = True
+        self._lbl_yolo_estado.setText(f"YOLO: {message}")
+
+    def _on_yolo_log(self, message: str):
+        if self._yolo_enabled and message:
+            self._lbl_yolo_estado.setToolTip(message)
+
+    def _on_yolo_result(self, packet):
+        if (
+            not self._yolo_enabled
+            or packet.get("generation") != self._generation
+            or packet.get("stream_epoch") != self._video_epoch
+        ):
+            return
+        age = time.monotonic() - packet.get("submitted_at", 0.0)
+        if age > YOLO_RESULT_MAX_AGE_S:
+            return
+        detections = packet.get("detections", [])
+        self._video.mostrar_detecciones_yolo(detections)
+        self._yolo_last_result_at = time.monotonic()
+        self._lbl_yolo_estado.setText(
+            f"YOLO: {len(detections)} objetivo(s) · "
+            f"{packet.get('inference_ms', 0.0):.0f} ms inferencia · "
+            f"frame {packet.get('sequence', '?')}"
+        )
 
     def _on_vel_mov(self, valor: int):
         self._vel_mov = valor
@@ -1442,7 +1549,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._closing:
             capture_running = self._captura_thread is not None and self._captura_thread.is_alive()
-            if self._ptz.isRunning() or self._ocr.isRunning() or capture_running:
+            if (
+                self._ptz.isRunning()
+                or self._ocr.isRunning()
+                or capture_running
+                or self._yolo_worker.is_running()
+            ):
                 event.ignore()
                 QTimer.singleShot(100, self.close)
             else:
@@ -1455,6 +1567,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.removeEventFilter(self)
         self._desconectar()
+        self._yolo_worker.stop()
         self._ptz.detener_hilo()
         self._ocr.detener()
         self._set_estado('Cerrando procesos…', '#F9E2AF')

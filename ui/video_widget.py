@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
@@ -8,10 +8,17 @@ from config import ALTO_RETICULA_PCT, ANCHO_RETICULA_PCT, GROSOR_RETICULA
 
 
 class VideoWidget(QWidget):
+    roi_selected = Signal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap = None
         self._regions = []
+        self._yolo_detections = []
+        self._frame_size = None
+        self._selection_enabled = False
+        self._selection_start = None
+        self._selection_current = None
         self._placeholder = "Configurá la cámara para ver el video"
         self.setMinimumSize(720, 405)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -23,6 +30,7 @@ class VideoWidget(QWidget):
     def mostrar_frame(self, frame_bgr: np.ndarray):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         alto, ancho, canales = rgb.shape
+        self._frame_size = (ancho, alto)
         imagen = QImage(
             rgb.data, ancho, alto, canales * ancho, QImage.Format.Format_RGB888
         ).copy()
@@ -32,10 +40,23 @@ class VideoWidget(QWidget):
     def limpiar(self):
         self._pixmap = None
         self._regions = []
+        self._yolo_detections = []
+        self._frame_size = None
         self.update()
 
     def mostrar_regiones(self, regions):
         self._regions = regions
+        self.update()
+
+    def mostrar_detecciones_yolo(self, detections):
+        self._yolo_detections = detections
+        self.update()
+
+    def habilitar_seleccion_roi(self, enabled: bool):
+        self._selection_enabled = bool(enabled)
+        self._selection_start = None
+        self._selection_current = None
+        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
         self.update()
 
     def tiene_imagen(self) -> bool:
@@ -53,6 +74,55 @@ class VideoWidget(QWidget):
         x = (vw - dw) // 2
         y = (vh - dh) // 2
         return QRect(x, y, dw, dh)
+
+    def _image_point(self, point):
+        dest = self._rect_destino()
+        if dest is None or self._frame_size is None:
+            return None
+        x = min(max(point.x(), dest.left()), dest.right())
+        y = min(max(point.y(), dest.top()), dest.bottom())
+        image_width, image_height = self._frame_size
+        return (
+            (x - dest.left()) * image_width / max(1, dest.width()),
+            (y - dest.top()) * image_height / max(1, dest.height()),
+        )
+
+    def mousePressEvent(self, event):
+        if self._selection_enabled and event.button() == Qt.MouseButton.LeftButton:
+            dest = self._rect_destino()
+            if dest is not None and dest.contains(event.position().toPoint()):
+                point = event.position().toPoint()
+                self._selection_start = point
+                self._selection_current = point
+                self.update()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._selection_start is not None:
+            self._selection_current = event.position().toPoint()
+            self.update()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._selection_start is not None and event.button() == Qt.MouseButton.LeftButton:
+            start = self._selection_start
+            end = event.position().toPoint()
+            first = self._image_point(start)
+            second = self._image_point(end)
+            self._selection_start = None
+            self._selection_current = None
+            if first is not None and second is not None:
+                x1, y1 = first
+                x2, y2 = second
+                if abs(x2 - x1) >= 8 and abs(y2 - y1) >= 8:
+                    self.roi_selected.emit(
+                        [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+                    )
+            self.update()
+            return
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -80,3 +150,27 @@ class VideoWidget(QWidget):
             painter.setPen(QPen(QColor('#F9E2AF'), 2, Qt.PenStyle.DashLine))
             painter.drawRect(x, y, int((x2-x1)*sx), int((y2-y1)*sy))
             painter.drawText(x, max(dest.y()+12,y-4), 'Texto candidato' + (' estable' if region.get('stable') else ''))
+
+        scale_x = dest.width() / self._pixmap.width()
+        scale_y = dest.height() / self._pixmap.height()
+        for detection in self._yolo_detections:
+            x1, y1, x2, y2 = detection['box']
+            x = int(dest.x() + x1 * scale_x)
+            y = int(dest.y() + y1 * scale_y)
+            width = max(1, int((x2 - x1) * scale_x))
+            height = max(1, int((y2 - y1) * scale_y))
+            manual = detection.get('source') == 'manual-flow'
+            color = QColor('#F9E2AF') if manual else QColor('#A6E3A1')
+            painter.setPen(QPen(color, 2))
+            painter.drawRect(x, y, width, height)
+            confidence = detection.get('confidence')
+            confidence_text = f"{confidence:.2f}" if confidence is not None else "manual"
+            track_id = detection.get('track_id')
+            track_text = f"ID {track_id}" if track_id is not None else "sin ID"
+            label = f"{detection.get('class_name', 'Precinto')} {confidence_text} · {track_text}"
+            painter.drawText(x, max(dest.y() + 14, y - 4), label)
+
+        if self._selection_start is not None and self._selection_current is not None:
+            selection = QRect(self._selection_start, self._selection_current).normalized()
+            painter.setPen(QPen(QColor('#89B4FA'), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(selection)

@@ -293,6 +293,30 @@ class UiSafetyTests(unittest.TestCase):
             self.assertEqual(display.call_count,1)
             infer.assert_not_called()
 
+    def test_yolo_uses_existing_video_samples_without_opening_another_rtsp_stream(self):
+        w = self.window
+        frame = np.zeros((180, 320, 3), np.uint8)
+        captured_at = time.monotonic()
+        w._generation = 5
+        w._video_epoch = 2
+        w._last_display_sequence = -1
+        w._service = Mock(ultimo_error=None)
+        w._service.copiar_muestra.return_value = (frame, 24, captured_at, 2)
+        w._yolo_enabled = True
+
+        with patch.object(w._yolo_worker, 'submit_frame') as submit, \
+                patch.object(CameraService, 'iniciar_lectura') as open_stream:
+            w._tick_video()
+
+        submit.assert_called_once_with(
+            frame,
+            sequence=24,
+            submitted_at=captured_at,
+            generation=5,
+            stream_epoch=2,
+        )
+        open_stream.assert_not_called()
+
     def test_both_applications_display_same_full_visual_observation(self):
         w = self.window
         w._generation,w._video_epoch = 3,2
