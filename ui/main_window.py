@@ -24,6 +24,7 @@ from PySide6.QtGui import QColor, QKeyEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
+    QDoubleSpinBox,
     QApplication,
     QDateEdit,
     QDialog,
@@ -72,7 +73,20 @@ from modulos.settings_store import (
     save_camera_settings,
     settings_completos,
 )
-from modulos.yolo_runtime import YOLO_RESULT_MAX_AGE_S
+from modulos.yolo_runtime import YOLO_DEBUG_FRAME_DIR, YOLO_RESULT_MAX_AGE_S
+from modulos.yolo_runtime import (
+    YOLO_SEARCH_INTERVAL_S, YOLO_CONFIRM_HITS, YOLO_CONFIRM_S,
+    YOLO_CAPTURE_CONFIDENCE, YOLO_CAPTURE_COOLDOWN_S, YOLO_REARM_ABSENCE_S,
+    YOLO_CONFIRM_MAX_GAP_S,
+)
+from modulos.yolo_vigilance import VigilanceController
+from modulos.auto_ptz import AutoPtzController
+from modulos.ptz_simulation import PtzSimulation
+from modulos.yolo_quality import image_quality
+from modulos.yolo_runtime import AUTO_PTZ_OPTIONS
+from modulos.yolo_runtime import (
+    YOLO_CORRECT_INTERVAL_S, YOLO_FLOW_INTERVAL_S, YOLO_HYBRID_OPTIONS, YOLO_TRACK_INTERVAL_S,
+)
 from modulos.yolo_worker import YoloWorker
 from ui.hold_button import HoldButton
 from ui.settings_dialog import SettingsDialog
@@ -173,8 +187,45 @@ class MainWindow(QMainWindow):
         self._yolo_enabled = False
         self._yolo_error_latched = False
         self._yolo_last_result_at = None
+        self._yolo_sample_saved = False
+        self._vigilance = VigilanceController(
+            interval_s=YOLO_SEARCH_INTERVAL_S, confirm_hits=YOLO_CONFIRM_HITS,
+            confirm_s=YOLO_CONFIRM_S, confidence=YOLO_CAPTURE_CONFIDENCE,
+            cooldown_s=YOLO_CAPTURE_COOLDOWN_S, absence_s=YOLO_REARM_ABSENCE_S,
+            max_gap_s=YOLO_CONFIRM_MAX_GAP_S, max_age_s=YOLO_RESULT_MAX_AGE_S,
+            track_interval_s=YOLO_TRACK_INTERVAL_S,
+            correct_interval_s=YOLO_CORRECT_INTERVAL_S,
+        )
 
         self._ptz = PtzWorker(self)
+        self._ptz.pulse_result.connect(self._on_auto_pulse)
+        self._ptz.pulse_diagnostic.connect(self._on_pulse_diagnostic)
+        sim = PtzSimulation(None, self._on_yolo_log)
+        self._auto = AutoPtzController(self._vigilance, pulse=None, stop=None, focus=None,
+            focus_pending=lambda: False, capture=None, capture_allowed=lambda: False,
+            available=lambda: not self._closing, observe_only=True,
+            **AUTO_PTZ_OPTIONS, **YOLO_HYBRID_OPTIONS)
+        self._demo_gate = VigilanceController()
+        self._demo_auto = AutoPtzController(self._demo_gate, pulse=sim.pulse,
+            stop=sim.stop, focus=sim.focus,
+            focus_pending=lambda: False, capture=sim.capture,
+            available=lambda: self._demo_active and not self._closing,
+            capture_allowed=lambda: self._allow_photo.isChecked(), **AUTO_PTZ_OPTIONS)
+        sim.controller = self._demo_auto
+        self._simulation = sim
+        self._demo_active = False
+        self._demo_timer = QTimer(self)
+        self._demo_timer.setInterval(300)
+        self._demo_timer.timeout.connect(self._demo_step)
+        self._last_auto_state = None
+        self._last_follow_rejection = float('-inf')
+        self._last_flow_submit = float('-inf')
+        self._last_infer_send = None
+        self._last_yolo_job_was_inference = False
+        self._infer_gap_ms = None
+        self._infer_ms = None
+        self._trial_token = None
+        self._auto_capture_id = None
         self._ptz.error.connect(self._on_ptz_error)
         self._ptz.focus_status.connect(self._on_focus_status)
         self._ptz.configuration_status.connect(lambda text: self._set_estado(text, '#F9E2AF'))
@@ -221,7 +272,7 @@ class MainWindow(QMainWindow):
         self._lbl_canal.setWordWrap(True)
         self._lbl_ocr_motor = QLabel("Motor OCR: cargando…")
 
-        self._btn_yolo = QPushButton("Activar detector YOLO")
+        self._btn_yolo = QPushButton("Activar vigilancia YOLO")
         self._btn_yolo.setCheckable(True)
         self._btn_yolo.toggled.connect(self._alternar_yolo)
         self._btn_yolo_seleccionar = QPushButton("Seleccionar / recuperar objetivo")
@@ -236,6 +287,42 @@ class MainWindow(QMainWindow):
         lay_yolo.addWidget(self._btn_yolo)
         lay_yolo.addWidget(self._btn_yolo_seleccionar)
         lay_yolo.addWidget(self._lbl_yolo_estado)
+        self._lbl_worker = QLabel()
+        lay_yolo.addWidget(self._lbl_worker)
+        self._lbl_yolo_issue = QLabel()
+        self._lbl_yolo_issue.setWordWrap(True)
+        lay_yolo.addWidget(self._lbl_yolo_issue)
+        self._btn_auto = QPushButton('Seguir precinto en video real')
+        self._btn_auto.setCheckable(True)
+        self._btn_auto.toggled.connect(self._toggle_auto)
+        self._allow_photo = QPushButton('Simular captura 101 y OCR')
+        self._allow_photo.setCheckable(True)
+        self._allow_photo.setEnabled(False)
+        emergency = QPushButton('DETENER PTZ')
+        emergency.setStyleSheet('background-color: #982c35; color: white')
+        emergency.pressed.connect(self._stop_from_panel)
+        for button in (self._btn_auto, self._allow_photo, emergency):
+            lay_yolo.addWidget(button)
+        self._threshold = QDoubleSpinBox()
+        self._threshold.setRange(.45, .95)
+        self._threshold.setSingleStep(.01)
+        self._threshold.setValue(self._vigilance.confidence)
+        self._threshold.setPrefix('Adquisición de prueba ')
+        self._threshold.valueChanged.connect(self._set_acquisition)
+        lay_yolo.addWidget(self._threshold)
+        self._btn_demo = QPushButton('Demostración completa con objetivo virtual')
+        self._btn_demo.setCheckable(True)
+        self._btn_demo.toggled.connect(self._toggle_demo)
+        lay_yolo.addWidget(self._btn_demo)
+        self._real_trial = QPushButton('PTZ REAL · preparar un pulso pan +5 / 80 ms')
+        self._real_trial.setToolTip('Centrado físico automático bloqueado: falta verificar desplazamiento y calibrar ambos ejes')
+        self._real_trial.clicked.connect(self._prepare_real_trial)
+        lay_yolo.addWidget(self._real_trial)
+        self._events = QTextEdit()
+        self._events.setReadOnly(True)
+        self._events.setMaximumHeight(110)
+        self._events.document().setMaximumBlockCount(100)
+        lay_yolo.addWidget(self._events)
 
         self._btn_config = QPushButton("Configurar cámara")
         self._btn_config.clicked.connect(self._abrir_config)
@@ -1032,7 +1119,7 @@ class MainWindow(QMainWindow):
         if not settings_completos(self._cfg):
             self._abrir_config()
             return
-        self._desconectar()
+        self._desconectar(preserve_follow=True)
         self._service = CameraService(
             self._cfg.usuario,
             self._cfg.password,
@@ -1047,7 +1134,8 @@ class MainWindow(QMainWindow):
         self._set_estado(f"Conectando al canal {self._canal_activo}…", "#F9E2AF")
         self._video.set_placeholder("Conectando al stream RTSP…")
 
-    def _desconectar(self):
+    def _desconectar(self, *, preserve_follow=False):
+        self._stop_auto('Desconexión', preserve_request=preserve_follow)
         self._generation += 1
         self._ocr.invalidar()
         self._region_packet = None
@@ -1061,6 +1149,9 @@ class MainWindow(QMainWindow):
             return
         # El worker conserva el servicio viejo hasta enviar su parada y cerrarlo.
         self._ptz.configurar(None, None)
+        if self._trial_token is not None:
+            self._trial_token = None
+            self._real_trial.setEnabled(True)
         self._service.detener_lectura()
         self._service = None
         self._rtsp_thread = None
@@ -1071,10 +1162,22 @@ class MainWindow(QMainWindow):
         self._actualizar_captura()
 
     def _tick_video(self):
+        if self._demo_active:
+            return
+        self._sync_yolo_vigilance()
+        capturing = self._capture_busy_for_yolo()
+        if self._yolo_enabled:
+            self._show_inference_indicator(capturing)
+            if capturing and not self._yolo_error_latched:
+                self._lbl_yolo_estado.setText('CAPTURANDO · captura / OCR en curso')
         if self._service is None:
+            self._vigilance.invalidate()
+            self._sync_follow_request(video_ready=False)
             return
         sample = self._service.copiar_muestra(after_sequence=self._last_display_sequence)
         if sample is None:
+            self._stop_auto('Video no disponible', preserve_request=True)
+            self._vigilance.invalidate()
             self._video.limpiar()
             self._region_packet = None
             if self._video_epoch is not None:
@@ -1090,8 +1193,23 @@ class MainWindow(QMainWindow):
                 self._video.set_placeholder('Esperando video reciente…')
                 self._set_estado('Sin video reciente', '#F9E2AF')
             self._actualizar_captura()
+            self._sync_follow_request(video_ready=False)
             return
         frame, sequence, captured_at, stream_epoch = sample
+        if self._video_epoch is not None and self._video_epoch != stream_epoch:
+            self._stop_auto('Cambió el flujo de video', preserve_request=True)
+        self._vigilance.set_context(self._generation, stream_epoch)
+        self._sync_follow_request(video_ready=True)
+        if self._auto.enabled and not capturing:
+            was_tracking = self._auto.tracking
+            self._auto.tick()
+            if was_tracking and not self._auto.tracking:
+                self._video.mostrar_detecciones_yolo([])
+            elif self._auto.tracking:
+                self._video.mostrar_detecciones_yolo(self._auto.visual_target())
+            self._show_auto_state()
+            if not self._auto.enabled:
+                self._stop_auto(self._auto.reason)
         if self._video_epoch != stream_epoch:
             self._ocr.invalidar()
             self._region_packet = None
@@ -1099,14 +1217,34 @@ class MainWindow(QMainWindow):
         if frame is not None:
             self._video.mostrar_frame(frame)
             self._last_display_sequence = sequence
-            if self._yolo_enabled:
+            infer = self._vigilance.due(tracking=self._auto.tracking, recovering=self._auto.recovering)
+            lock = self._auto.flow_seed if self._auto.tracking else None
+            now = time.monotonic()
+            flow_due = lock is not None and now - self._last_flow_submit >= YOLO_FLOW_INTERVAL_S
+            if (self._yolo_enabled and (infer or flow_due)
+                    and self._yolo_worker.accepts_frame()
+                    and not capturing):
+                if not self._yolo_sample_saved:
+                    self._guardar_muestra_yolo(frame)
                 self._yolo_worker.submit_frame(
                     frame,
                     sequence=sequence,
                     submitted_at=captured_at,
                     generation=self._generation,
                     stream_epoch=stream_epoch,
+                    track_visual=True,
+                    infer=infer,
+                    lock=lock,
                 )
+                self._last_yolo_job_was_inference = infer
+                if infer:
+                    sent_at = time.monotonic()
+                    if self._last_infer_send is not None:
+                        self._infer_gap_ms = (sent_at - self._last_infer_send) * 1000
+                    self._last_infer_send = sent_at
+                    self._vigilance.submitted()
+                else:
+                    self._last_flow_submit = now
         packet = self._region_packet
         if (DETECCION_EN_VIVO and packet and frame is not None and packet['shape'] == list(frame.shape)
                 and time.monotonic() - packet['captured_at'] <= REGION_MAX_AGE_S):
@@ -1119,7 +1257,10 @@ class MainWindow(QMainWindow):
         ):
             self._video.mostrar_detecciones_yolo([])
             self._yolo_last_result_at = None
-        if (DETECCION_EN_VIVO and frame is not None and self._ocr_listo and sequence != self._last_sequence
+            if (self._yolo_enabled and self._yolo_worker.is_ready() and not self._btn_auto.isChecked()
+                    and not capturing and not self._yolo_error_latched):
+                self._lbl_yolo_estado.setText('BUSCANDO · esperando resultado reciente')
+        if (not capturing and DETECCION_EN_VIVO and frame is not None and self._ocr_listo and sequence != self._last_sequence
                 and time.monotonic() - self._last_video_request >= SEGUIMIENTO_INTERVALO_S):
             self._last_sequence = sequence
             self._last_video_request = time.monotonic()
@@ -1161,21 +1302,42 @@ class MainWindow(QMainWindow):
             self._lbl_ocr_estado.setText('Candidato en video (requiere captura): ' + (analysis.suggested_text or 'sin lectura'))
 
     def _alternar_yolo(self, enabled: bool):
+        self._lbl_worker.clear()
+        self._lbl_yolo_issue.clear()
+        self._last_infer_send = self._infer_gap_ms = self._infer_ms = None
+        if not enabled:
+            self._stop_auto('YOLO desactivado')
+        self._vigilance.invalidate()
         self._yolo_enabled = bool(enabled)
         self._yolo_error_latched = False
         self._video.mostrar_detecciones_yolo([])
         self._yolo_last_result_at = None
         if enabled:
-            self._btn_yolo.setText("Desactivar detector YOLO")
+            self._yolo_sample_saved = False
+            self._btn_yolo.setText("Desactivar vigilancia YOLO")
             self._btn_yolo_seleccionar.setEnabled(True)
             self._yolo_worker.start()
         else:
-            self._btn_yolo.setText("Activar detector YOLO")
+            self._btn_yolo.setText("Activar vigilancia YOLO")
             self._btn_yolo_seleccionar.setChecked(False)
             self._btn_yolo_seleccionar.setEnabled(False)
             self._video.habilitar_seleccion_roi(False)
             self._yolo_worker.stop()
             self._lbl_yolo_estado.setText("YOLO local: desactivado")
+
+    def _guardar_muestra_yolo(self, frame):
+        # One diagnostic attempt per activation; it must not replace detector state.
+        self._yolo_sample_saved = True
+        try:
+            YOLO_DEBUG_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+            sample_path = YOLO_DEBUG_FRAME_DIR / (
+                "canal102_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".png"
+            )
+            if not cv2.imwrite(str(sample_path), frame):
+                raise OSError("No se pudo guardar la muestra")
+            self._on_yolo_log(f"Muestra del canal 102 guardada: {sample_path}")
+        except (OSError, cv2.error) as exc:
+            self._on_yolo_log(f"Diagnóstico de frame YOLO: {exc}")
 
     def _alternar_seleccion_yolo(self, enabled: bool):
         enabled = bool(enabled and self._yolo_enabled)
@@ -1193,54 +1355,410 @@ class MainWindow(QMainWindow):
         self._lbl_yolo_estado.setText("ROI manual enviada; siguiendo el objetivo…")
 
     def _on_yolo_status(self, message: str):
+        if self._demo_active:
+            self._on_yolo_log('Worker YOLO real durante simulación: ' + message)
+            return
         if self._yolo_enabled and not (
             self._yolo_error_latched and message == "YOLO detenido"
         ):
-            self._lbl_yolo_estado.setText(message)
+            if message.startswith('YOLO iniciando'):
+                self._last_infer_send = self._infer_gap_ms = self._infer_ms = None
+                if 'recuper' in message.lower():
+                    self._lbl_yolo_issue.setText(message)
+                if not self._yolo_error_latched:
+                    self._lbl_yolo_estado.setText('RECUPERANDO · esperando detector')
+                self._stop_auto('Reinicio del detector', preserve_request=True)
+                self._vigilance.invalidate()
+                self._video.mostrar_detecciones_yolo([])
+                self._sync_follow_request(video_ready=False)
+            elif message == 'YOLO detenido':
+                self._lbl_yolo_estado.setText('ERROR · detector detenido')
+                self._lbl_yolo_issue.setText(message)
 
     def _on_yolo_error(self, message: str):
+        if self._demo_active:
+            self._on_yolo_log('ERROR YOLO real durante simulación: ' + message)
+            return
+        self._on_yolo_log('ERROR YOLO: ' + message)
+        self._stop_auto('Error del detector', preserve_request=True)
+        self._vigilance.invalidate()
         self._yolo_error_latched = True
-        self._lbl_yolo_estado.setText(f"YOLO: {message}")
+        self._lbl_yolo_estado.setText(f"ERROR · {message}")
+        self._lbl_yolo_issue.setText(f'Último error YOLO · {message}')
+
+    def _capture_busy_for_yolo(self):
+        return (self._ocr_ocupado or self._captura_id_activa is not None or
+                (self._captura_thread is not None and self._captura_thread.is_alive()))
+
+    def _show_inference_indicator(self, capturing):
+        text = 'YOLO · última inferencia'
+        text += f' {self._infer_ms:.0f} ms' if self._infer_ms is not None else ' —'
+        if self._infer_gap_ms is not None:
+            text += f' · intervalo real {self._infer_gap_ms:.0f} ms'
+        if capturing:
+            text += ' · en pausa'
+        elif (self._last_yolo_job_was_inference and self._last_infer_send is not None
+              and self._yolo_worker.activity() == 'Procesando fotograma'
+              and time.monotonic() - self._last_infer_send >= .25):
+            text += ' · ocupado'
+        if text != self._lbl_worker.text():
+            self._lbl_worker.setText(text)
+        cmd = self._auto.decision if self._auto.enabled and not capturing else None
+        proposal = (f'Propuesta PTZ: pan {cmd["pan"]:+d}, tilt {cmd["tilt"]:+d}, zoom {cmd["zoom"]}'
+                    if cmd is not None else '')
+        if proposal != self._lbl_worker.toolTip():
+            self._lbl_worker.setToolTip(proposal)
 
     def _on_yolo_log(self, message: str):
-        if self._yolo_enabled and message:
+        if message:
+            if self._demo_active and self._demo_auto.state == 'FINALIZADO':
+                self._lbl_yolo_estado.setText('PTZ SIMULADO · ' + self._demo_auto.status)
+            self._events.append(datetime.now().astimezone().strftime('%H:%M:%S') + ' · ' + message)
             self._lbl_yolo_estado.setToolTip(message)
+            try:
+                from logging.handlers import RotatingFileHandler
+                import logging
+                logger = logging.getLogger('seaaiscan.yolo')
+                if not logger.handlers:
+                    YOLO_DEBUG_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+                    handler = RotatingFileHandler(
+                        YOLO_DEBUG_FRAME_DIR / 'detector.log', maxBytes=1_000_000,
+                        backupCount=2, encoding='utf-8',
+                    )
+                    handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+                    logger.addHandler(handler)
+                    logger.setLevel(logging.INFO)
+                    logger.propagate = False
+                logger.info(message)
+            except OSError:
+                pass
 
     def _on_yolo_result(self, packet):
+        if self._demo_active:
+            return
         if (
             not self._yolo_enabled
             or packet.get("generation") != self._generation
             or packet.get("stream_epoch") != self._video_epoch
         ):
             return
+        if self._capture_busy_for_yolo():
+            return
         age = time.monotonic() - packet.get("submitted_at", 0.0)
         if age > YOLO_RESULT_MAX_AGE_S:
+            self._video.mostrar_detecciones_yolo([])
             return
+        if not packet.get('flow_only'):
+            self._infer_ms = packet.get('inference_ms')
+            self._yolo_error_latched = False
+        if self._auto.enabled:
+            self._actualizar_captura()
+            try:
+                self._auto.observe(packet)
+                self._log_follow_rejection(packet, age)
+            except (TypeError, KeyError, ValueError, IndexError):
+                self._stop_auto('Resultado YOLO inválido')
+            if not self._auto.enabled:
+                self._stop_auto(self._auto.reason)
         detections = packet.get("detections", [])
+        if self._auto.enabled and self._auto.tracking:
+            detections = self._auto.visual_target()
+        elif self._auto.enabled and self._auto.state == 'PERDIDO':
+            detections = []
         self._video.mostrar_detecciones_yolo(detections)
-        self._yolo_last_result_at = time.monotonic()
-        self._lbl_yolo_estado.setText(
-            f"YOLO: {len(detections)} objetivo(s) · "
-            f"{packet.get('inference_ms', 0.0):.0f} ms inferencia · "
-            f"frame {packet.get('sequence', '?')}"
-        )
+        self._yolo_last_result_at = packet['submitted_at']
+        self._sync_yolo_vigilance()
+        self._actualizar_captura()
+        if self._auto.enabled:
+            self._show_auto_state()
+        elif not self._yolo_error_latched and not self._btn_auto.isChecked():
+            self._lbl_yolo_estado.setText('BUSCANDO · vigilancia YOLO activa')
+
+    def _sync_yolo_vigilance(self):
+        if self._auto.tracking:
+            return
+        capture_running = self._captura_thread is not None and self._captura_thread.is_alive()
+        if (not self._vigilance.processing and self._captura_id_activa is not None):
+            self._vigilance.started()
+        if (self._vigilance.processing and not self._ocr_ocupado
+                and self._captura_id_activa is None and not capture_running):
+            self._vigilance.finished()
+
+    def _set_acquisition(self, confidence):
+        self._stop_auto('Umbral cambiado; requiere nueva confirmación')
+        self._vigilance.confidence = confidence
+        self._vigilance.confirm_hits = max(YOLO_CONFIRM_HITS, 5) if confidence < .65 else YOLO_CONFIRM_HITS
+        self._vigilance.confirm_s = max(YOLO_CONFIRM_S, 1.2) if confidence < .65 else YOLO_CONFIRM_S
+        self._vigilance.invalidate()
+        self._on_yolo_log(f'Adquisición {confidence:.2f}, {self._vigilance.confirm_hits} fotogramas, '
+                          f'{self._vigilance.confirm_s:.1f} s; identidad y geometría estables')
+
+    def _show_auto_state(self):
+        controller = self._demo_auto if self._demo_active else self._auto
+        text = controller.status
+        if controller.state == 'VIGILANCIA':
+            text = 'BUSCANDO · ' + controller.gate.status
+        if self._demo_active:
+            text = 'PTZ SIMULADO · ' + text
+            if controller.target:
+                ex, ey, size = controller.geometry()
+                text += (f' · tamaño {size:.3f}/{controller.target_size:.3f}'
+                         f' · centro ({ex:.3f},{ey:.3f})'
+                         f' · zoom {controller._zoom_time:.2f}/{controller.max_zoom_s:.2f} s'
+                         f' · pasos {controller._zooms}/{controller.max_zoom_steps}'
+                         f' · nitidez {controller.target.get("sharpness", 0):.1f}/{controller.sharpness:.1f}')
+        else:
+            if controller.state == 'VIGILANCIA':
+                text = ('RECUPERANDO' if controller.gate.confirming else 'BUSCANDO') + f' · {controller.gate.status}'
+            elif controller.tracking:
+                text = 'RECUPERANDO · validando el objetivo' if controller.recovering else 'SIGUIENDO · precinto asociado'
+            text += ' · video real / solo observación'
+        event = text if self._demo_active or controller.state in ('PERDIDO', 'ERROR') else controller.state
+        if not self._demo_active and controller.tracking and controller.recovering:
+            event = (event, 'recuperación detector')
+        if event != self._last_auto_state:
+            self._last_auto_state = event
+            if not self._demo_active and controller.state == 'PERDIDO':
+                self._lbl_yolo_issue.setText(f'Última pérdida · {controller.reason}')
+                detail = controller.loss_detail or dict(
+                    previous_id=controller.target.get('track_id'),
+                    previous_source=controller.target.get('source'),
+                    candidate_id=None, candidate_source=None, iou=None, frame_age_ms=None)
+                self._on_yolo_log(text + ' · ' + json.dumps(detail, ensure_ascii=False))
+            else:
+                if not self._demo_active and controller.tracking:
+                    confidence = controller.target['confidence']
+                    age = time.monotonic() - controller._last_yolo
+                    self._on_yolo_log(f'{text} · confianza {confidence:.2f} · última confirmación YOLO {age:.2f} s')
+                else:
+                    self._on_yolo_log(text)
+        self._lbl_yolo_estado.setText(text)
+        return text
+
+    def _log_follow_rejection(self, packet, age):
+        if packet.get('flow_only') or self._auto.state == 'PERDIDO':
+            return
+        reason = None
+        if age > self._auto.target_age_s:
+            reason = 'Resultado fuera del plazo de seguimiento'
+        elif self._auto.state == 'VIGILANCIA':
+            if not self._vigilance.armed or self._vigilance.processing:
+                reason = self._vigilance.status
+            elif self._vigilance.reason != 'Primer candidato válido':
+                reason = self._vigilance.reason
+        elif self._auto.target_sequence != packet.get('sequence'):
+            reason = self._auto.reason
+        now = time.monotonic()
+        if not reason or now - self._last_follow_rejection < 5:
+            return
+        self._last_follow_rejection = now
+        scores = [d.get('confidence') for d in packet.get('detections', []) if d.get('source') == 'yolo']
+        confidence = max((v for v in scores if isinstance(v, (float, int))), default=None)
+        detail = dict(confidence=confidence, threshold=self._vigilance.confidence,
+                      frame_age_ms=round(age * 1000), worker_ms=packet.get('elapsed_ms'))
+        if self._auto.loss_detail:
+            detail.update(self._auto.loss_detail)
+        self._on_yolo_log(f'Seguimiento · {reason} · ' + json.dumps(detail, ensure_ascii=False))
+
+    def _toggle_demo(self, enabled):
+        if not enabled:
+            self._demo_timer.stop()
+            self._demo_auto.disable('Demostración detenida')
+            self._simulation.demo_box = None
+            self._demo_active = False
+            self._allow_photo.setChecked(False)
+            self._allow_photo.setEnabled(False)
+            self._on_yolo_log('DEMO detenida; video real disponible')
+            return
+        self._stop_auto('Inicio de demostración')
+        self._demo_active = True
+        self._demo_gate.finished()
+        self._demo_gate.armed = True
+        self._demo_gate.set_context(-1, -1)
+        self._demo_auto.enable()
+        self._simulation.demo_box = [100., 240., 180., 360.]
+        self._simulation.shape = [600, 1000, 3]
+        self._demo_sequence = 0
+        self._allow_photo.setEnabled(True)
+        self._allow_photo.setChecked(True)
+        self._on_yolo_log('DEMO VIRTUAL: coordenadas inyectadas; captura/OCR virtuales, sin lecturas auténticas')
+        self._show_auto_state()
+        self._demo_timer.start()
+
+    def _demo_step(self):
+        if not self._demo_active:
+            return
+        import numpy as np
+        frame = np.zeros(self._simulation.shape, np.uint8)
+        cv2.putText(frame, 'DEMO VIRTUAL - SIN CAMARA NI OCR REAL', (25, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, .7, (255, 255, 255), 2)
+        self._demo_sequence += 1
+        detection = dict(box=list(self._simulation.demo_box), confidence=.90,
+                         source='yolo', class_name='Precinto SIMULADO',
+                         track_id=9001,
+                         sharpness=100)
+        generation, epoch = self._demo_gate.context
+        packet = dict(generation=generation, stream_epoch=epoch, sequence=self._demo_sequence,
+                      submitted_at=time.monotonic(), shape=list(self._simulation.shape),
+                      detections=[dict(detection, class_name='Precinto')])
+        self._demo_auto.observe(packet)
+        self._show_auto_state()
+        if self._demo_auto.state != 'FINALIZADO':
+            self._demo_auto.tick()
+        self._show_auto_state()
+        self._video.mostrar_frame(frame)
+        self._video.mostrar_detecciones_yolo([detection])
+        if self._demo_auto.state in ('FINALIZADO', 'ERROR'):
+            self._demo_timer.stop()
+
+    def _on_auto_pulse(self, packet):
+        if self._trial_token is not None and packet.get('token') == self._trial_token:
+            self._on_yolo_log(f"PTZ REAL · {packet.get('phase')} · confirmado={packet.get('ok')}")
+            if not packet.get('ok') or packet.get('phase') == 'stopped':
+                self._trial_token = None
+                self._real_trial.setEnabled(True)
+            return
+        self._auto.motion_result(packet)
+        if self._btn_auto.isChecked() and not self._auto.enabled:
+            self._stop_auto(self._auto.reason)
+
+    def _on_pulse_diagnostic(self, packet):
+        self._on_yolo_log('PTZ REAL · diagnóstico · ' + json.dumps(packet, ensure_ascii=False))
+
+    def _toggle_auto(self, enabled):
+        if self._demo_active:
+            self._btn_demo.setChecked(False)
+        if enabled:
+            self._btn_auto.setText('Detener seguimiento en video real')
+            self._sync_follow_request(video_ready=False)
+        else:
+            was_active = self._auto.enabled
+            self._stop_auto('Seguimiento cancelado por el operador')
+            self._btn_auto.setText('Seguir precinto en video real')
+            if not was_active:
+                self._lbl_yolo_estado.setText('Solicitud de seguimiento cancelada')
+                self._on_yolo_log('Solicitud de seguimiento cancelada')
+
+    def _sync_follow_request(self, *, video_ready):
+        if not self._btn_auto.isChecked() or self._closing or self._demo_active or self._auto.enabled:
+            return
+        if not self._yolo_enabled or not self._yolo_worker.is_ready():
+            message = 'Esperando detector'
+        elif not video_ready:
+            message = 'Esperando video'
+        elif self._held_ptz or self._trial_token is not None:
+            message = 'Esperando fin del control manual'
+        elif self._captura_id_activa is not None or self._ocr_ocupado or self._vigilance.processing:
+            message = 'Vigilancia activa · esperando fin de captura/OCR'
+        else:
+            self._auto.enable()
+            self._show_auto_state()
+            return
+        if self._yolo_error_latched:
+            return
+        if self._lbl_yolo_estado.text() != message:
+            self._lbl_yolo_estado.setText(message)
+        if self._last_auto_state != message:
+            self._last_auto_state = message
+            self._on_yolo_log(message)
+
+    def _stop_auto(self, reason, *, preserve_request=False):
+        if self._demo_active:
+            self._demo_auto.disable(reason)
+            self._demo_timer.stop()
+            self._demo_active = False
+            self._simulation.demo_box = None
+            self._btn_demo.blockSignals(True)
+            self._btn_demo.setChecked(False)
+            self._btn_demo.blockSignals(False)
+        if preserve_request and self._btn_auto.isChecked():
+            if self._auto.enabled:
+                self._auto.disable(reason)
+                self._video.mostrar_detecciones_yolo([])
+                self._on_yolo_log('Seguimiento suspendido · ' + reason)
+            return
+        if self._auto.enabled or self._btn_auto.isChecked() or self._allow_photo.isEnabled():
+            if self._auto.enabled:
+                self._auto.disable(reason)
+            self._btn_auto.blockSignals(True)
+            self._btn_auto.setChecked(False)
+            self._btn_auto.blockSignals(False)
+            self._btn_auto.setText('Seguir precinto en video real')
+            self._allow_photo.setChecked(False)
+            self._allow_photo.setEnabled(False)
+            self._lbl_yolo_estado.setText(reason)
+            self._on_yolo_log(reason)
 
     def _on_vel_mov(self, valor: int):
         self._vel_mov = valor
         self._lbl_vel_mov.setText(f"Giro de camara: {valor}")
 
     def _enviar_ptz(self, pan=0, tilt=0, zoom=0, focus=0):
+        if self._trial_token is not None:
+            self._stop_from_panel()
+        self._stop_auto('Control manual')
         if self._service is None:
             return
         self._ptz.enviar(pan=pan, tilt=tilt, zoom=zoom, focus=focus)
         self._set_estado("Moviendo", "#89B4FA")
 
     def _detener_ptz(self):
+        if self._trial_token is not None:
+            self._stop_from_panel()
+            return
+        self._stop_auto('STOP operador')
         if self._service is None:
             return
         self._ptz.enviar(0, 0, 0, 0)
 
+    def _stop_from_panel(self):
+        if self._trial_token is not None:
+            self._trial_token = None
+            self._ptz.cancelar_automatismos()
+            self._real_trial.setEnabled(True)
+            self._on_yolo_log('PTZ REAL · STOP solicitado por operador')
+            return
+        if self._demo_active:
+            self._btn_demo.setChecked(False)
+            return
+        if self._auto.enabled or self._btn_auto.isChecked():
+            self._stop_auto('Seguimiento detenido por el operador')
+        else:
+            self._detener_ptz()
+
+    def _prepare_real_trial(self):
+        if (self._service is None or not self._video.tiene_imagen()
+                or self._trial_token is not None or self._ocr_ocupado
+                or self._held_ptz or self._ptz.enfoque_pendiente()):
+            self._on_yolo_log('PTZ REAL · prueba no disponible; comprobar conexión, enfoque y controles')
+            return
+        answer = QMessageBox.question(self, 'Autorizar UN pulso físico',
+            'Se enviará pan +5. Tras la confirmación del servicio se temporizan 80 ms '
+            'y se solicita STOP. Un watchdog independiente solicita STOP a los 500 ms '
+            'desde el envío si la operación sigue pendiente. La latencia física depende de Hikvision y la red. '
+            'No se ejecutará zoom. ¿Autorizas este único pulso ahora?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            self._on_yolo_log('PTZ REAL · operador no autorizó el pulso')
+            return
+        self._stop_auto('Preparación del pulso REAL')
+        self._real_trial.setEnabled(False)
+        self._trial_token = self._ptz.enviar_pulso(pan=5, duration_s=.08)
+        if self._trial_token is None:
+            self._real_trial.setEnabled(True)
+            self._on_yolo_log('PTZ REAL · orden rechazada antes de envío: worker no disponible')
+            return
+        self._on_yolo_log(f'PTZ REAL · pulso autorizado token {self._trial_token}; esperando STOP')
+        QTimer.singleShot(5000, self._trial_timeout)
+
+    def _trial_timeout(self):
+        if self._trial_token is not None:
+            self._stop_from_panel()
+            self._on_yolo_log('PTZ REAL · timeout de confirmación; comprobar parada física')
+
     def _solicitar_autofoco(self):
+        self._stop_auto('Control manual de enfoque')
         if self._service is None or not self._video.tiene_imagen():
             self._lbl_foco_estado.setText(
                 "Enfoque: conecta la cámara y espera video reciente"
@@ -1285,9 +1803,12 @@ class MainWindow(QMainWindow):
             )
 
     def _on_ptz_error(self, mensaje: str):
+        self._stop_auto(mensaje)
         self._set_estado(f"PTZ: {mensaje}", "#F38BA8")
 
-    def _capturar(self):
+    def _capturar(self, checked=False, *, automatic=False):
+        if not automatic:
+            self._stop_auto('Captura manual', preserve_request=True)
         if (
             not self._btn_capturar.isEnabled()
             or self._service is None
@@ -1303,6 +1824,8 @@ class MainWindow(QMainWindow):
         stream_epoch = self._video_epoch
         self._captura_id_activa = capture_id
         self._ocr_ocupado = True
+        if not automatic:
+            self._vigilance.started()
         self._actualizar_captura()
 
         self._lbl_ocr_estado.setText(
@@ -1382,6 +1905,20 @@ class MainWindow(QMainWindow):
 
         try:
             frame = packet["frame"]
+            if capture_id == self._auto_capture_id:
+                if self._auto.enabled and self._auto.state == 'CAPTURANDO':
+                    h, w = self._auto.shape[:2]
+                    x1, y1, x2, y2 = self._auto.target['box']
+                    quality = image_quality(frame, (x1/w, y1/h, x2/w, y2/h))
+                    passed = quality['ok'] and quality['sharpness'] >= self._auto.photo_sharpness
+                    if not self._auto.photo_checked(capture_id, passed):
+                        self._auto_capture_id = None
+                        self._finalizar_captura(capture_id)
+                        return
+                else:
+                    self._auto_capture_id = None
+                    self._finalizar_captura(capture_id)
+                    return
             carpeta = asegurar_carpeta_capturas()
 
             paths = reservar_captura(
@@ -1458,10 +1995,14 @@ class MainWindow(QMainWindow):
             and stream_epoch == self._video_epoch
             and not self._closing
         )
+        automatic = capture_id == self._auto_capture_id
+        if automatic:
+            self._auto_capture_id = None
+            self._auto.failed_capture(capture_id, mensaje)
         self._finalizar_captura(
             capture_id,
             mensaje=mensaje if is_current else None,
-            mostrar_error=is_current,
+            mostrar_error=is_current and not automatic,
         )
 
     def _on_ocr_listo(self):
@@ -1490,12 +2031,14 @@ class MainWindow(QMainWindow):
         else:
             self._finalizar_captura(capture_id)
         self._evidence = context['evidence']
+        saved = True
         try:
             with open(context['report'], 'x', encoding='utf-8') as stream:
                 json.dump(dict(analysis=analysis.to_dict(), evidence=self._evidence), stream,
                           ensure_ascii=False, indent=2, allow_nan=False)
             decision = self._actualizar_manifiesto_por_ocr(analysis)
         except (OSError, ValueError) as exc:
+            saved = False
             decision = 'Sin confirmación: no se pudo conservar la trazabilidad: ' + str(exc)
         selected_text = getattr(analysis,'recognized_text','') or analysis.confirmed_identifier or analysis.suggested_text or ''
         best = next((c for c in analysis.candidates if c.text == selected_text), None)
@@ -1506,6 +2049,17 @@ class MainWindow(QMainWindow):
             self._registrar_lectura_ocr(analysis, context, selected_text, conf, score, variante)
         except Exception as exc:
             self._lbl_registro_estado.setText(f"Registro: error al guardar ({exc})")
+            saved = False
+        if capture_id is not None and capture_id != self._auto_capture_id:
+            recognized = getattr(analysis, 'confirmed_identifier', None) or (
+                getattr(analysis, 'recognized_text', '') if analysis.status == 'texto_reconocido' else '')
+            self._vigilance.finished(success=saved and bool(recognized.strip()))
+        if capture_id is not None and capture_id == self._auto_capture_id:
+            self._auto_capture_id = None
+            if not saved:
+                self._stop_auto('Error al guardar la lectura')
+            else:
+                self._auto.ocr_result(capture_id, success=bool(selected_text.strip()))
         self._lbl_ocr_estado.setText(f'{analysis.status}: {analysis.reason}')
         self._lbl_comparacion.setText('Comparación: '+decision if self._manifiesto else
                                       'Comparación: sin manifiesto; lectura visual independiente')
@@ -1532,10 +2086,14 @@ class MainWindow(QMainWindow):
                 and context['generation'] == self._generation
                 and context['stream_epoch'] == self._video_epoch
             )
+            automatic = capture_id == self._auto_capture_id
+            if automatic:
+                self._auto_capture_id = None
+                self._auto.failed_capture(capture_id, packet['error'])
             self._finalizar_captura(
                 capture_id,
                 mensaje=packet['error'] if is_current else None,
-                mostrar_error=is_current,
+                mostrar_error=is_current and not automatic,
             )
             return
         if (context and not self._closing and self._service is not None
@@ -1547,6 +2105,8 @@ class MainWindow(QMainWindow):
         self._lbl_estado.setStyleSheet(f"color: {color};")
 
     def closeEvent(self, event):
+        if self._demo_active:
+            self._btn_demo.setChecked(False)
         if self._closing:
             capture_running = self._captura_thread is not None and self._captura_thread.is_alive()
             if (

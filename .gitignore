@@ -7,6 +7,7 @@ __pycache__/
 *.pyd
 
 .venv/
+.venv-*/
 venv/
 env/
 ENV/
@@ -89,6 +90,8 @@ checkpoints/
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite3-*
+*.db-*
 
 # =========================
 # Archivos comprimidos y exportaciones
@@ -99,7 +102,21 @@ checkpoints/
 *.bak
 
 capturas_precintos/
-.env
-venv/
-__pycache__/
-*.pyc
+videos_prueba/
+/reports/
+/entrega/
+/reporte_lecturas*.xlsx
+*.xlsx
+*.xls
+*.jsonl
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.sqlite-*
+*.local.*
+*.token
+*.pfx
+*.mp4
+*.avi
+*.mov

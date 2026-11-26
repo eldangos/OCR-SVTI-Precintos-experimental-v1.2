@@ -10,8 +10,18 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 from pathlib import Path
 from time import perf_counter
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from modulos.yolo_runtime import (
+    PROJECT_ROOT, YOLO_CONFIDENCE, YOLO_IMAGE_SIZE, YOLO_WEIGHTS_PATH, verify_v5,
+)
+
+os.environ["YOLO_OFFLINE"] = "True"
+os.environ["YOLO_AUTOINSTALL"] = "False"
 
 import cv2
 import numpy as np
@@ -19,9 +29,7 @@ import torch
 from ultralytics import YOLO
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_WEIGHTS = PROJECT_ROOT / "modelos" / "SeaAIScan_V3_2042.pt"
-DEFAULT_OUTPUT_DIR = Path.home() / "Desktop" / "SeaAIScan-YOLO-Results"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "reports" / "yolo_demo"
 VIDEO_SIZE = (704, 576)
 
 
@@ -206,19 +214,25 @@ def track_video(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
+    parser.add_argument("--weights", type=Path, help="Checkpoint local para una comparación explícita")
     parser.add_argument("--image", type=Path)
     parser.add_argument("--video", type=Path)
     parser.add_argument("--make-video", type=Path, metavar="IMAGE")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--device", default="auto", help="auto, cpu o índice CUDA como 0")
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--imgsz", type=int, default=YOLO_IMAGE_SIZE)
+    parser.add_argument("--confidence", type=float, default=YOLO_CONFIDENCE)
     parser.add_argument("--frames", type=int, default=45)
     parser.add_argument("--fps", type=float, default=15.0)
     args = parser.parse_args()
 
-    if not args.weights.is_file():
+    if args.weights is None:
+        args.weights = YOLO_WEIGHTS_PATH
+        try:
+            verify_v5(args.weights)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+    elif not args.weights.is_file():
         parser.error(f"No se encuentra el modelo: {args.weights}")
 
     device = selected_device(args.device)

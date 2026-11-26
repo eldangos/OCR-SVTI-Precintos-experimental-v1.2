@@ -16,10 +16,8 @@ Módulo de gestión de configuración y persistencia de credenciales de la cáma
 import os
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
 from PySide6.QtCore import QSettings
-
-load_dotenv()
+from config import CANAL_RTSP_FOTO
 
 ORG = "ACCELERA"
 APP = "SVTI-Precintos"
@@ -30,7 +28,7 @@ class CameraSettings:
     ip: str = ""
     usuario: str = ""
     password: str = ""
-    canal: str = "101"
+    canal: str = CANAL_RTSP_FOTO
 
 
 def _qsettings() -> QSettings:

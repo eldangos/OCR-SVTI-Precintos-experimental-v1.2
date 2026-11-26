@@ -191,15 +191,18 @@ class FocusPriorityTests(unittest.TestCase):
         self.assertFalse(any(c[0]=='auto' for c in service.calls))
         self.assertTrue(any(c[0]=='manual' for c in service.calls))
 
-    def test_lost_video_cancels_zoom_recovery(self):
+    def test_lost_video_stops_manual_zoom_and_preserves_recovery(self):
         def prepare(w,s):
             w.enviar(zoom=20)
             w.cancelar_automatismos()
         worker,service = self.run_worker(prepare)
-        self.assertTrue(service.ready.wait(2))
-        import time
-        time.sleep(.03)
-        self.assertFalse(any(c[0]=='auto' for c in service.calls))
+        self.assertTrue(service.auto_requested.wait(2))
+        self.assertEqual(sum(c[0]=='auto' for c in service.calls), 1)
+
+    def test_explicit_auto_still_uses_historical_stop(self):
+        worker, service = self.run_worker(lambda w, s: w.solicitar_autofoco())
+        self.assertTrue(service.auto_requested.wait(2))
+        self.assertEqual(service.calls[0], ('move', 'fixture', dict(pan=0, tilt=0, zoom=0, focus=0)))
 
 
 if __name__=='__main__':

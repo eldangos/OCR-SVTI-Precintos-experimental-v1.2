@@ -11,9 +11,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+import cv2
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QApplication, QLineEdit
+from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
 
 from modulos.excel_manifest import RegistroEsperado
 from modulos.ocr_analysis import AnalysisResult, Candidate, Detection
@@ -26,9 +27,155 @@ from motor import MotorWindow
 from modulos.ocr_reader import RecognitionResult
 from PySide6.QtWidgets import QTableWidgetItem
 from config import CANAL_RTSP_FOTO, CANAL_RTSP_VIDEO
+from modulos.yolo_runtime import YOLO_DEBUG_FRAME_DIR
 
 
 class UiSafetyTests(unittest.TestCase):
+    def test_yolo_indicator_and_effective_dispatch_cadence(self):
+        w = self._prepare_capture()
+        w._yolo_enabled = w._yolo_sample_saved = True
+        w._auto = Mock(enabled=False, tracking=False, recovering=False, flow_seed=None)
+        w._yolo_worker = Mock()
+        w._vigilance.interval_s = .5
+        w._vigilance.correct_interval_s = .65
+        w._vigilance.track_interval_s = .15
+        clock = [100.]
+        seq = [0]
+        frame = np.zeros((180, 320, 3), np.uint8)
+        w._vigilance.clock = lambda: clock[0]
+        w._lbl_yolo_estado.setText('BUSCANDO · vigilancia YOLO activa')
+        w._infer_ms = 108.
+
+        def tick(at):
+            clock[0] = at
+            seq[0] += 1
+            w._service.copiar_muestra.return_value = (frame, seq[0], at, 2)
+            w._tick_video()
+
+        def inference_count():
+            return sum(call.kwargs['infer'] for call in w._yolo_worker.submit_frame.call_args_list)
+
+        with patch('ui.main_window.time.monotonic', side_effect=lambda: clock[0]):
+            for i, (tracking, recovering, interval) in enumerate(
+                    [(False, False, .5), (True, False, .65), (True, True, .15)]):
+                w._auto.tracking, w._auto.recovering = tracking, recovering
+                w._auto.flow_seed = {'sequence': 1} if tracking else None
+                w._yolo_worker.submit_frame.reset_mock()
+                start = 100. + i * 2
+                w._yolo_worker.accepts_frame.return_value = True
+                w._yolo_worker.activity.return_value = 'Detector listo'
+                tick(start)
+                tick(start + interval - .01)
+                self.assertEqual(inference_count(), 1)
+                w._yolo_worker.accepts_frame.return_value = False
+                w._yolo_worker.activity.return_value = 'Procesando fotograma'
+                tick(start + interval + .001)
+                self.assertEqual(inference_count(), 1)
+                w._yolo_worker.accepts_frame.return_value = True
+                tick(start + interval + .010)
+                self.assertEqual(inference_count(), 2)
+                self.assertAlmostEqual(w._infer_gap_ms, interval * 1000 + 10)
+                self.assertIn('108 ms', w._lbl_worker.text())
+                self.assertTrue(w._lbl_yolo_estado.text().startswith('BUSCANDO'))
+            w._ocr_ocupado = True
+            sent = w._yolo_worker.submit_frame.call_count
+            tick(106.)
+            self.assertEqual(w._yolo_worker.submit_frame.call_count, sent)
+            self.assertIn('en pausa', w._lbl_worker.text())
+            self.assertTrue(w._lbl_yolo_estado.text().startswith('CAPTURANDO'))
+
+    def test_single_real_pulse_preparation_uses_only_bounded_command_with_fake_transport(self):
+        w = self._prepare_capture()
+        with patch('ui.main_window.QMessageBox.question', return_value=QMessageBox.StandardButton.Yes), \
+                patch.object(w._ptz, 'enviar_pulso', return_value=(1, 2)) as pulse, \
+                patch.object(w._ptz, 'cancelar_automatismos') as stop:
+            w._prepare_real_trial()
+            pulse.assert_called_once_with(pan=5, duration_s=.08)
+            stop.assert_not_called()
+            self.assertFalse(w._real_trial.isEnabled())
+            w._on_auto_pulse(dict(token=(1, 2), phase='stopped', ok=True))
+            self.assertIsNone(w._trial_token)
+            self.assertTrue(w._real_trial.isEnabled())
+            self.assertIn('confirmado=True', w._events.toPlainText())
+            self.assertFalse(w._auto.enabled)
+
+    def test_real_detection_enters_virtual_center_zoom_and_single_pulse_is_gated(self):
+        from PySide6.QtTest import QTest
+        w = self._prepare_capture()
+        w._yolo_enabled = True
+        w._vigilance.set_context(3, 2)
+        w._auto.state = 'DETECTADO'
+        w._vigilance.started()
+        w._auto.disable('cancelación antes de foto')
+        self.assertTrue(w._vigilance.armed)
+        with patch.object(w._yolo_worker, 'is_ready', return_value=True), \
+                patch.object(w._ptz, 'enviar_pulso') as move, \
+                patch.object(w._ptz, 'cancelar_automatismos') as stop, \
+                patch('ui.main_window.CameraService.capturar_frame_rtsp') as photo, \
+                patch.object(w._ocr, 'pedir_ocr') as ocr, \
+                patch('ui.main_window.QMessageBox.question', return_value=QMessageBox.StandardButton.No):
+            w._threshold.setValue(.55)
+            w._btn_auto.setChecked(True)
+            for seq in range(6):
+                QTest.qWait(350)
+                w._on_yolo_result(dict(sequence=seq, generation=3, stream_epoch=2,
+                    submitted_at=time.monotonic(), shape=[180, 320, 3], detections=[
+                    dict(box=[40, 70, 64, 106], confidence=.59, source='yolo',
+                         class_name='Precinto', track_id=1, sharpness=100)]))
+            self.assertTrue(w._demo_active)
+            self.assertIn(w._auto.state, w._auto.ACTIVE)
+            for _ in range(60):
+                QTest.qWait(300)
+                if w._auto.state == 'LISTO PARA CAPTURAR':
+                    break
+            self.assertEqual(w._auto.state, 'LISTO PARA CAPTURAR')
+            history = w._events.toPlainText()
+            for expected in ('Adquisición YOLO confirmada', 'CENTRANDO', 'ACERCANDO', 'STOP confirmado'):
+                self.assertIn(expected, history)
+            move.assert_not_called()
+            stop.assert_not_called()
+            photo.assert_not_called()
+            ocr.assert_not_called()
+            w._btn_demo.setChecked(False)
+            w._prepare_real_trial()
+            move.assert_not_called()
+            self.assertFalse(w._registro_lecturas.listar_filas())
+    def test_complete_virtual_demo_and_low_confidence_diagnosis(self):
+        from PySide6.QtTest import QTest
+        w = self.window
+        with patch.object(w._ptz, 'enviar_pulso') as move, \
+                patch.object(w._ptz, 'cancelar_automatismos') as stop, \
+                patch('ui.main_window.CameraService.capturar_frame_rtsp') as photo, \
+                patch.object(w._ocr, 'pedir_ocr') as ocr:
+            w._btn_demo.setChecked(True)
+            states = set()
+            for _ in range(60):
+                QTest.qWait(300)
+                states.add(w._auto.state)
+                if w._auto.state == 'FINALIZADO':
+                    break
+            history = w._events.toPlainText()
+            for state in ('DETECTADO', 'CENTRANDO', 'ACERCANDO', 'ESTABILIZANDO',
+                          'CAPTURANDO', 'OCR', 'FINALIZADO'):
+                self.assertIn(state, history)
+            self.assertIn('DEMO VIRTUAL', w._lbl_yolo_estado.text())
+            self.assertIn('OCR SIMULADO', w._events.toPlainText())
+            self.assertFalse(w._registro_lecturas.listar_filas())
+            move.assert_not_called()
+            stop.assert_not_called()
+            photo.assert_not_called()
+            ocr.assert_not_called()
+            w._btn_demo.setChecked(False)
+            w._vigilance.set_context(1, 1)
+            w._vigilance.armed = True
+            p = dict(sequence=1, generation=1, stream_epoch=1, submitted_at=time.monotonic(),
+                     shape=[600, 1000, 3], detections=[dict(box=[100,240,180,360], confidence=.48,
+                     class_name='Precinto', source='yolo', track_id=6)])
+            w._vigilance.observe(p, lambda: self.fail('single frame triggered'))
+            self.assertIn('0.48 < 0.65', w._vigilance.status)
+            w._threshold.setValue(.48)
+            self.assertEqual(w._vigilance.confirm_hits, 5)
+            self.assertGreaterEqual(w._vigilance.confirm_s, 1.2)
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -71,6 +218,40 @@ class UiSafetyTests(unittest.TestCase):
         self.assertFalse(w._video.tiene_imagen())
         self.assertFalse(w._btn_capturar.isEnabled())
         self.assertIsNone(w._video_epoch)
+
+    def test_auto_ptz_preview_then_capture_with_simulated_101_and_ocr(self):
+        w = self._prepare_capture()
+        w._yolo_enabled = True
+        w._vigilance.set_context(3, 2)
+        now = [time.monotonic()]
+        w._vigilance.clock = w._auto.clock = lambda: now[0]
+        photo = np.random.default_rng(4).integers(0, 255, (360, 640, 3), dtype=np.uint8)
+        self.assertFalse(w._btn_auto.isChecked())
+        with patch.object(w._yolo_worker, 'is_ready', return_value=True), \
+                patch('ui.main_window.threading.Thread') as thread, \
+                patch('ui.main_window.asegurar_carpeta_capturas', return_value=Path(self._registro_tmp.name)), \
+                patch.object(w._ocr, 'pedir_ocr') as ocr:
+            thread.return_value.is_alive.return_value = False
+            w._btn_auto.setChecked(True)
+            for seq in range(12):
+                now[0] += .5
+                w._on_yolo_result(dict(sequence=seq, generation=3, stream_epoch=2,
+                    submitted_at=now[0], shape=[180, 320, 3], detections=[
+                        dict(box=[132, 56, 188, 124], confidence=.85, track_id=6,
+                             source='yolo', class_name='Precinto', sharpness=100)]))
+                w._auto.tick()
+                if seq == 3:
+                    w._on_focus_status('Modo AUTO verificado por lectura ISAPI')
+            self.assertEqual(w._auto.state, 'LISTO PARA CAPTURAR')
+            thread.assert_not_called()
+            w._allow_photo.setChecked(True)
+            w._auto.tick()
+            from PySide6.QtTest import QTest
+            QTest.qWait(100)
+            self.assertEqual(w._auto.state, 'FINALIZADO')
+            thread.assert_not_called()
+            ocr.assert_not_called()
+            self.assertFalse(w._registro_lecturas.listar_filas())
 
     def test_manual_capture_passes_entire_photo_without_manifest(self):
         w = self._prepare_capture()
@@ -305,6 +486,7 @@ class UiSafetyTests(unittest.TestCase):
         w._yolo_enabled = True
 
         with patch.object(w._yolo_worker, 'submit_frame') as submit, \
+                patch.object(w._yolo_worker, 'accepts_frame', return_value=True), \
                 patch.object(CameraService, 'iniciar_lectura') as open_stream:
             w._tick_video()
 
@@ -314,8 +496,33 @@ class UiSafetyTests(unittest.TestCase):
             submitted_at=captured_at,
             generation=5,
             stream_epoch=2,
+            track_visual=True,
         )
         open_stream.assert_not_called()
+
+    def test_yolo_saves_the_same_existing_video_frame_once_for_diagnosis(self):
+        w = self.window
+        frame = np.zeros((180, 320, 3), np.uint8)
+        frame[40:100, 90:150] = 255
+        w._generation = 5
+        w._video_epoch = 2
+        w._last_display_sequence = -1
+        w._service = Mock(ultimo_error=None)
+        w._service.copiar_muestra.return_value = (frame, 24, time.monotonic(), 2)
+        w._yolo_enabled = True
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch('ui.main_window.YOLO_DEBUG_FRAME_DIR', Path(tmp)), \
+                patch.object(w._yolo_worker, 'accepts_frame', return_value=True), \
+                patch.object(w._yolo_worker, 'submit_frame') as submit:
+            w._tick_video()
+            saved_frames = list(Path(tmp).glob('canal102_*.png'))
+            self.assertEqual(len(saved_frames), 1)
+            np.testing.assert_array_equal(cv2.imread(str(saved_frames[0])), frame)
+            w._service.copiar_muestra.return_value = (frame, 25, time.monotonic(), 2)
+            w._tick_video()
+            self.assertEqual(len(list(Path(tmp).glob('canal102_*.png'))), 1)
+            self.assertEqual(submit.call_count, 1)  # Frames inside the cadence are skipped.
 
     def test_both_applications_display_same_full_visual_observation(self):
         w = self.window

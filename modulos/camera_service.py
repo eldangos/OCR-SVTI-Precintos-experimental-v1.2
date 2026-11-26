@@ -533,13 +533,19 @@ class CameraService:
             self.ultimo_error = str(exc) if isinstance(exc, ValueError) else f"{type(exc).__name__}: petición ISAPI fallida"
             return False
 
+    def detener_ptz(self, ip) -> bool:
+        return self._mover_ptz(ip, 0, 0, 0)
+
+    def _mover_ptz(self, ip, pan, tilt, zoom) -> bool:
+        url = f"http://{ip}/ISAPI/PTZCtrl/channels/1/continuous"
+        xml = f"<PTZData><pan>{pan}</pan><tilt>{tilt}</tilt><zoom>{zoom}</zoom></PTZData>"
+        return self._put_xml(url, xml)
+
     def mover_camara(self, ip, pan=0, tilt=0, zoom=0, focus=0) -> bool:
         detener = pan == 0 and tilt == 0 and zoom == 0 and focus == 0
         outcomes, errors = [], []
         if pan != 0 or tilt != 0 or zoom != 0 or detener:
-            url = f"http://{ip}/ISAPI/PTZCtrl/channels/1/continuous"
-            xml = f"<PTZData><pan>{pan}</pan><tilt>{tilt}</tilt><zoom>{zoom}</zoom></PTZData>"
-            outcomes.append(self._put_xml(url, xml))
+            outcomes.append(self._mover_ptz(ip, pan, tilt, zoom))
             if not outcomes[-1]:
                 errors.append(self.ultimo_error)
 

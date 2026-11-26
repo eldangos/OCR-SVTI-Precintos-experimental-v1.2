@@ -1,5 +1,9 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+RAIZ_PROYECTO = Path(__file__).resolve().parent
+load_dotenv(RAIZ_PROYECTO / ".env", override=False)
 
 # Debe setearse antes del primer VideoCapture
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
@@ -9,7 +13,6 @@ GROSOR_RETICULA = 2
 ANCHO_RETICULA_PCT = 0.30
 ALTO_RETICULA_PCT = 0.20
 
-RAIZ_PROYECTO = Path(__file__).resolve().parent
 CARPETA_CAPTURAS = RAIZ_PROYECTO / "capturas_precintos"
 ARCHIVO_REGISTRO_LECTURAS = RAIZ_PROYECTO / "registro_lecturas.sqlite3"
 ARCHIVO_REPORTE_LECTURAS = RAIZ_PROYECTO / "reporte_lecturas.xlsx"

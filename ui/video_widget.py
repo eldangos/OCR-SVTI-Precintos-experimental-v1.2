@@ -49,6 +49,8 @@ class VideoWidget(QWidget):
         self.update()
 
     def mostrar_detecciones_yolo(self, detections):
+        if self._yolo_detections == detections:
+            return
         self._yolo_detections = detections
         self.update()
 
@@ -138,11 +140,12 @@ class VideoWidget(QWidget):
         rh = max(8, int(dest.height() * ALTO_RETICULA_PCT))
         rx = dest.center().x() - rw // 2
         ry = dest.center().y() - rh // 2
-        pen = QPen(QColor(0, 180, 80))
+        pen = QPen(QColor('#8893A0'), 1, Qt.PenStyle.DotLine)
         pen.setWidth(GROSOR_RETICULA)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(rx, ry, rw, rh)
+        painter.drawText(rx + 4, ry + 14, 'Guía fija')
         for region in self._regions:
             x1, y1, x2, y2 = region['box']
             sx, sy = dest.width()/self._pixmap.width(), dest.height()/self._pixmap.height()
@@ -159,15 +162,21 @@ class VideoWidget(QWidget):
             y = int(dest.y() + y1 * scale_y)
             width = max(1, int((x2 - x1) * scale_x))
             height = max(1, int((y2 - y1) * scale_y))
-            manual = detection.get('source') == 'manual-flow'
-            color = QColor('#F9E2AF') if manual else QColor('#A6E3A1')
-            painter.setPen(QPen(color, 2))
+            source = detection.get('source')
+            color, style = {
+                'retained': ('#B0B8C4', Qt.PenStyle.DotLine),
+                'auto-flow': ('#F9E2AF', Qt.PenStyle.DashLine),
+                'manual-flow': ('#89B4FA', Qt.PenStyle.DashLine),
+            }.get(source, ('#A6E3A1', Qt.PenStyle.SolidLine))
+            painter.setPen(QPen(QColor(color), 2, style))
             painter.drawRect(x, y, width, height)
             confidence = detection.get('confidence')
             confidence_text = f"{confidence:.2f}" if confidence is not None else "manual"
             track_id = detection.get('track_id')
             track_text = f"ID {track_id}" if track_id is not None else "sin ID"
-            label = f"{detection.get('class_name', 'Precinto')} {confidence_text} · {track_text}"
+            origin = {'auto-flow': 'KLT', 'manual-flow': 'ROI manual',
+                      'retained': 'Posición retenida'}.get(source, 'YOLO')
+            label = f"{origin} · {detection.get('class_name', 'Precinto')} {confidence_text} · {track_text}"
             painter.drawText(x, max(dest.y() + 14, y - 4), label)
 
         if self._selection_start is not None and self._selection_current is not None:
